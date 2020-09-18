@@ -22,8 +22,9 @@ from .framework import Program, Variable, program_guard, default_main_program, d
 from .executor import global_scope
 from .data_feeder import DataFeeder, BatchedTensorProvider
 from .multiprocess_utils import multiprocess_queue_set, CleanupFuncRegistrar, _cleanup_mmap, _cleanup, _set_SIGCHLD_handler
-from .dataloader import BatchSampler, Dataset
-from .dataloader.dataloader_iter import _DataLoaderIterSingleProcess, _DataLoaderIterMultiProcess, default_collate_fn
+from .dataloader import BatchSampler, Dataset, IterableDataset
+from .dataloader.dataloader_iter import _DataLoaderIterSingleProcess, _DataLoaderIterMultiProcess, _DatasetKind, default_collate_fn
+from .dataloader.batch_sampler import _InfiniteIterableSampler
 from .layers.io import monkey_patch_reader_methods, _copy_reader_var_, double_buffer
 from .unique_name import UniqueNameGenerator
 import logging
@@ -84,6 +85,30 @@ def _convert_places(places):
     return ret
 
 
+# NOTE(chenweihang): _reader_process_loop must be top level method to be pickled
+def _reader_process_loop(batch_reader, data_queue):
+    try:
+        # set signal handler
+        core._set_process_signal_handler()
+
+        # NOTE: [ mmap files clear ] When the child process exits unexpectedly,
+        # some shared memory objects may have been applied for but have not yet
+        # been put into the inter-process Queue. This part of the object needs
+        # to be cleaned up when the process ends.
+        CleanupFuncRegistrar.register(_cleanup_mmap)
+
+        for batch in batch_reader():
+            tensor_list = core._convert_to_tensor_list(batch)
+            data_queue.put(tensor_list)
+            core._remove_tensor_list_mmap_fds(tensor_list)
+        data_queue.put(None)
+    except KeyboardInterrupt:
+        # NOTE: Main process will raise KeyboardInterrupt anyways, ignore it in child process
+        pass
+    except:
+        six.reraise(*sys.exc_info())
+
+
 class DataLoaderBase(object):
     def __init__(self):
         self._places = None
@@ -136,8 +161,9 @@ class DataLoader(object):
 
     Args:  
         dataset(Dataset): the dataset to load data from, should be an
-            instance of subclass of :code:`paddle.io.Dataset`.
-        feed_list (list(Variable)|tuple(Variable)): feed variable list.
+            instance of subclass of :code:`paddle.io.Dataset` or
+            :code:`paddle.io.IterableDataset`.
+        feed_list (list(Tensor)|tuple(Tensor)): feed variable list.
             The variables should be created by :code:`fluid.data()`.
             :attr:`feed_list` must be set if :attr:`return_list` is
             False. Default None.
@@ -295,6 +321,10 @@ class DataLoader(object):
 
             # -------------------------------------------------------
 
+    .. note::
+        For reading iterable dataset with multiprocess Dataloader,
+        please see :code:`paddle.io.IterableDataset`
+
     """
 
     def __init__(self,
@@ -348,6 +378,18 @@ class DataLoader(object):
         assert timeout >= 0, "timeout should be a non-negative value"
         self.timeout = timeout
 
+        if isinstance(dataset, IterableDataset):
+            self.dataset_kind = _DatasetKind.ITER
+            if shuffle:
+                raise ValueError(
+                    "IterableDataset not support shuffle, but got shuffle={}".
+                    format(shuffle))
+            if batch_sampler is not None:
+                raise ValueError(
+                    "IterableDataset expect unspecified batch_sampler")
+        else:
+            self.dataset_kind = _DatasetKind.MAP
+
         if batch_sampler is not None:
             assert isinstance(batch_sampler, BatchSampler), \
                 "batch_sampler should be None or subclass instance " \
@@ -360,11 +402,15 @@ class DataLoader(object):
             assert batch_size is not None and batch_size > 0, \
                 "batch_size should be a positive value when " \
                 "batch_sampler is not given"
-            self.batch_sampler = BatchSampler(
-                dataset=dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                drop_last=drop_last)
+            if isinstance(dataset, IterableDataset):
+                self.batch_sampler = _InfiniteIterableSampler(dataset,
+                                                              batch_size)
+            else:
+                self.batch_sampler = BatchSampler(
+                    dataset=dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    drop_last=drop_last)
 
         self.pin_memory = False
         if in_dygraph_mode():
@@ -789,7 +835,8 @@ class DygraphGeneratorLoader(DataLoaderBase):
             global multiprocess_queue_set
             multiprocess_queue_set.add(self._data_queue)
             self._process = multiprocessing.Process(
-                target=self._reader_process_loop)
+                target=_reader_process_loop,
+                args=(self._batch_reader, self._data_queue))
             self._process.daemon = True
             self._process.start()
 
@@ -844,28 +891,6 @@ class DygraphGeneratorLoader(DataLoaderBase):
         self._thread_done_event.set()
         self._blocking_queue.kill()
         logging.error("DataLoader reader thread raised an exception!")
-
-    def _reader_process_loop(self):
-        try:
-            # set signal handler
-            core._set_process_signal_handler()
-
-            # NOTE: [ mmap files clear ] When the child process exits unexpectedly,
-            # some shared memory objects may have been applied for but have not yet
-            # been put into the inter-process Queue. This part of the object needs
-            # to be cleaned up when the process ends.
-            CleanupFuncRegistrar.register(_cleanup_mmap)
-
-            for batch in self._batch_reader():
-                tensor_list = core._convert_to_tensor_list(batch)
-                self._data_queue.put(tensor_list)
-                core._remove_tensor_list_mmap_fds(tensor_list)
-            self._data_queue.put(None)
-        except KeyboardInterrupt:
-            # NOTE: Main process will raise KeyboardInterrupt anyways, ignore it in child process
-            pass
-        except:
-            six.reraise(*sys.exc_info())
 
     def _reader_thread_loop_for_multiprocess(self):
         while not self._thread_done_event.is_set():
@@ -1017,7 +1042,7 @@ class GeneratorLoader(DataLoaderBase):
         self._reader = core.create_py_reader(
             self.queue, self._var_names, self._shapes, self._dtypes,
             self._need_check_feed, self._places, self._use_double_buffer,
-            self._drop_last, True)
+            self._drop_last, False)
 
     def _init_non_iterable(self):
         lod_levels = []
@@ -1687,7 +1712,7 @@ class PyReader(DataLoaderBase):
 
 class DatasetLoader(DataLoaderBase):
     def __init__(self, dataset, places, drop_last):
-        assert isinstance(dataset, paddle.fleet.dataset.
+        assert isinstance(dataset, paddle.distributed.fleet.dataset.
                           DatasetBase), "dataset must be type of DatasetBase"
         assert not in_dygraph_mode(
         ), "DatasetLoader is not supported in dygraph mode yet"
@@ -1701,13 +1726,13 @@ class DatasetLoader(DataLoaderBase):
             logging.warn('thread_num {} which is set in Dataset is ignored'.
                          format(dataset.thread_num))
 
-        dataset.set_thread(thread_num)
+        dataset._set_thread(thread_num)
 
-        if isinstance(dataset, paddle.fleet.dataset.
+        if isinstance(dataset, paddle.distributed.fleet.dataset.
                       InMemoryDataset) and dataset.queue_num > thread_num:
             logging.warn("queue_num {} which is set in Dataset is ignored".
                          format(dataset.queue_num))
-            dataset.set_queue_num(thread_num)
+            dataset._set_queue_num(thread_num)
 
         self._dataset = dataset
         use_slots = [
